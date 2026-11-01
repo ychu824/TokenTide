@@ -55,7 +55,7 @@ The widget floats above every window, on every Space and over full-screen apps. 
 
 | What | Source | Refresh |
 |---|---|---|
-| Limit % and reset times | `GET api.anthropic.com/api/oauth/usage` with Claude Code's OAuth token | every 90 s |
+| Limit % and reset times | Claude Code's status line (optional, see below), otherwise `GET api.anthropic.com/api/oauth/usage` with Claude Code's OAuth token | live via status line; otherwise every 5 min while Claude Code is active, 15 min when idle, and when you hover over stale data |
 | Plan name | `subscriptionType` / `rateLimitTier` in the Keychain entry, with `/api/oauth/profile` as a fallback | once |
 | Tokens and model mix | Claude Code's session logs, `~/.claude/projects/**/*.jsonl` | every 5 s, and when you hover |
 
@@ -64,7 +64,15 @@ The widget floats above every window, on every Space and over full-screen apps. 
 - **Token counting.** Tokens are input + output + cache writes. Cache reads are excluded.
 - **Token share is not limit share.** Opus and Fable tokens weigh more against your limits than Sonnet tokens.
 - **Log reading is incremental.** TokenTide keeps a byte offset per file and parses only new lines, so a scan takes milliseconds.
-- **Rate limits.** If the endpoint returns 429, TokenTide backs off per `Retry-After` (at least 2 min) and keeps showing the cached numbers.
+- **Rate limits.** Anthropic throttles the usage endpoint hard, and the limit is shared with Claude Code's own `/usage`. TokenTide polls adaptively, and on a 429 backs off exponentially (2 → 4 → 8 → 16 → 30 min) while keeping the last numbers on screen.
+
+### Live numbers with no polling (recommended)
+
+Right-click the widget and choose **Use Claude Code Status Line**. Claude Code passes your 5h/7d usage to its status-line command on every update. TokenTide installs a tiny script (`~/.claude/tokentide/statusline.sh`) that saves just that `rate_limits` object for the widget, then runs your existing status line unchanged. With this on, TokenTide hits the usage endpoint only every 30 min, to pick up the plan and per-model windows.
+
+- This edits `statusLine` in `~/.claude/settings.json`. A backup is saved next to it as `settings.json.tokentide-backup`, and choosing the menu item again restores your original setting.
+- If you had no status line, the script prints a short `5h 23% · 7d 41% used`.
+- The numbers update while Claude Code is in use. When it's idle, TokenTide falls back to occasional polling.
 
 ## Caveats
 

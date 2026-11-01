@@ -9,6 +9,7 @@ TokenTide reads an OAuth token that can act on your Claude account, so here is e
 | Keychain item `Claude Code-credentials` (via `/usr/bin/security`) | read | To get the OAuth access token and plan tier that Claude Code stored |
 | `~/.claude/projects/**/*.jsonl` | read | To get Claude Code token counts and the model mix |
 | `https://api.anthropic.com/api/oauth/usage` and `/api/oauth/profile` | HTTPS GET | To get limit percentages, reset times and the plan |
+| `~/.claude/settings.json`, `~/.claude/tokentide/` | read and write, **only if you enable "Use Claude Code Status Line"** | Points `statusLine` at TokenTide's script, which stores only the `rate_limits` object Claude Code passes it. The original setting is saved and restored when you turn it off |
 | App `UserDefaults` (`io.github.ychu824.TokenTide`) | read and write | Stores the widget position and the last limit percentages and reset times |
 
 **Nothing else.** There is no analytics, no telemetry, no update checker and no third-party host.

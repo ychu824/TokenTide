@@ -237,7 +237,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setWindow(content: panelRect(store.panelSize))
             windowIsExpanded = true
         }
-        store.scanTokens()   // freshest model mix the moment you look
+        store.scanTokens()        // freshest model mix the moment you look
+        store.refreshIfStale()    // and limits, if they're more than a few minutes old
         // Let SwiftUI lay out once at the new window size (circle still pinned in its
         // corner), then morph.
         Task { @MainActor [weak self] in
@@ -316,6 +317,7 @@ struct TokenStats: Equatable {
     var totalDay = 0
     var by5h: [String: Int] = [:]
     var byDay: [String: Int] = [:]
+    var lastActivity: Date?      // newest Claude Code API call seen in the logs
 }
 
 enum Family {
@@ -382,6 +384,12 @@ final class Store: ObservableObject {
     private var tokenTimer: Timer?
     private var busy = false
     private var notBefore = Date.distantPast           // backoff after a 429
+    private var backoffLevel = 0                       // consecutive 429s
+    private var lastAttempt = Date.distantPast
+    private var apiWindows: [UsageWindow] = []         // last good API result (has per-model windows)
+    private var apiFetchedAt = Date.distantPast
+    private var bridgeAt = Date.distantPast            // mtime of the last status-line snapshot used
+    @Published var bridgeEnabled = StatusLineBridge.isEnabled
     private static let cacheKey = "TokenTide.limits"   // minimal: [{id, pct, resetsAt}]
     private static let cacheTimeKey = "TokenTide.limitsAt"
     private var scanning = false
@@ -409,18 +417,74 @@ final class Store: ObservableObject {
             updatedAt = UserDefaults.standard.object(forKey: Self.cacheTimeKey) as? Date
             expireWindows()
         }
-        refresh()
+        readBridge()
         scanTokens()
-        // Limits: 90s is plenty; the endpoint rate-limits aggressive polling.
-        timer = Timer.scheduledTimer(withTimeInterval: 90, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
-        // Local logs: cheap incremental tail, so poll often.
+        tick()
+        // One cheap 5s loop: tail the local logs, pick up status-line snapshots, and
+        // decide whether a network fetch is due. The network side is rate-limited
+        // hard by Anthropic, so it is adaptive (see pollInterval) and backs off.
         tokenTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.expireWindows()
-                self?.scanTokens()
-            }
+            Task { @MainActor in self?.tick() }
+        }
+    }
+
+    private func tick() {
+        expireWindows()
+        readBridge()
+        scanTokens()
+        if Date().timeIntervalSince(apiFetchedAt) >= pollInterval { refresh() }
+    }
+
+    // How long a fetched result is good for.
+    //  - Status-line bridge is feeding fresh 5h/7d numbers: the API is only needed for
+    //    the plan and per-model weekly windows, so 30 min.
+    //  - Claude Code active in the last 15 min: numbers are moving, 5 min.
+    //  - Otherwise (idle, or only using claude.ai): 15 min.
+    private var pollInterval: TimeInterval {
+        let now = Date()
+        if now.timeIntervalSince(bridgeAt) < 600 { return 1800 }
+        if let a = stats.lastActivity, now.timeIntervalSince(a) < 900 { return 300 }
+        return 900
+    }
+
+    // Called when the panel opens: fetch only if what's on screen is getting old.
+    func refreshIfStale() {
+        if Date().timeIntervalSince(max(apiFetchedAt, bridgeAt)) > 180 { refresh() }
+    }
+
+    // MARK: Status-line bridge
+
+    private func readBridge() {
+        guard bridgeEnabled, let snap = StatusLineBridge.read(), snap.at > bridgeAt else { return }
+        bridgeAt = snap.at
+        merge(snap.windows, at: snap.at)
+    }
+
+    // Status-line windows (5h/7d, fresher) override the API's; per-model windows
+    // only come from the API.
+    private func merge(_ fresh: [UsageWindow], at: Date) {
+        var byId = Dictionary(uniqueKeysWithValues: apiWindows.map { ($0.id, $0) })
+        for w in fresh { byId[w.id] = w }
+        let order = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]
+        let merged = order.compactMap { byId[$0] }
+        guard !merged.isEmpty else { return }
+        windows = merged
+        updatedAt = max(updatedAt ?? .distantPast, at)
+        if let enc = try? JSONEncoder().encode(merged) {
+            UserDefaults.standard.set(enc, forKey: Self.cacheKey)
+            UserDefaults.standard.set(updatedAt, forKey: Self.cacheTimeKey)
+        }
+        if status?.hasPrefix("Rate limited") == true && Date().timeIntervalSince(at) < 600 { status = nil }
+    }
+
+    func toggleBridge() {
+        do {
+            if bridgeEnabled { try StatusLineBridge.disable() } else { try StatusLineBridge.enable() }
+            bridgeEnabled = StatusLineBridge.isEnabled
+            status = bridgeEnabled ? "Connected to Claude Code status line" : nil
+            readBridge()
+        } catch {
+            status = "Couldn't update Claude Code settings: \(error.localizedDescription)"
         }
     }
 
@@ -432,7 +496,14 @@ final class Store: ObservableObject {
         windows = windows.map { w in
             (w.resetsAt ?? .distantFuture) <= now ? UsageWindow(id: w.id, pct: 0, resetsAt: nil) : w
         }
-        refresh()
+        refresh()   // subject to backoff like any other fetch
+    }
+
+    private func rateLimitedStatus() -> String {
+        let mins = max(1, Int((notBefore.timeIntervalSinceNow / 60).rounded(.up)))
+        var s = "Rate limited, retry in \(mins) min" + staleSuffix()
+        if !bridgeEnabled { s += " · Tip: right-click → Use Claude Code Status Line" }
+        return s
     }
 
     private func staleSuffix() -> String {
@@ -440,9 +511,18 @@ final class Store: ObservableObject {
         return " · data from \(u.formatted(date: .omitted, time: .shortened))"
     }
 
-    // force = the user chose Refresh; skips the 429 backoff.
-    func refresh(force: Bool = false) {
-        guard !busy, force || Date() >= notBefore else { return }
+    // manual = the user chose Refresh. It never skips a 429 backoff (retrying early
+    // only extends the throttle), but it does skip the normal poll interval.
+    func refresh(manual: Bool = false) {
+        let now = Date()
+        if manual { readBridge(); scanTokens() }
+        guard !busy else { return }
+        guard now >= notBefore else {
+            if manual { status = rateLimitedStatus() }
+            return
+        }
+        guard manual || now.timeIntervalSince(lastAttempt) >= 60 else { return }
+        lastAttempt = now
         busy = true
         Task {
             await fetchLimits()
@@ -469,27 +549,33 @@ final class Store: ObservableObject {
             switch code {
             case 200:
                 let w = Parser.windows(from: try JSONSerialization.jsonObject(with: data))
-                windows = w
-                // Cache only what's displayed — never the raw response.
-                if !w.isEmpty, let enc = try? JSONEncoder().encode(w) {
-                    UserDefaults.standard.set(enc, forKey: Self.cacheKey)
-                    UserDefaults.standard.set(Date(), forKey: Self.cacheTimeKey)
+                backoffLevel = 0
+                apiFetchedAt = Date()
+                apiWindows = w
+                // A fresher status-line snapshot keeps priority for 5h/7d.
+                if bridgeEnabled, let snap = StatusLineBridge.read(), snap.at > apiFetchedAt.addingTimeInterval(-60) {
+                    merge(snap.windows, at: snap.at)
+                } else {
+                    merge([], at: apiFetchedAt)   // caches only what's displayed, never the raw response
                 }
                 if plan == nil && !profileTried {
                     profileTried = true
                     plan = await Profile.plan(token: t)
                 }
-                updatedAt = Date()
                 status = w.isEmpty ? "No limit fields in response (API changed?)" : nil
             case 401, 403:
                 token = nil   // re-read Keychain next round; Claude Code refreshes it when used
                 status = "Token expired — open Claude Code to refresh" + staleSuffix()
             case 429:
-                // Honor Retry-After (seconds), at least 2 minutes. Keep showing the
-                // cached numbers, but always say they're stale.
-                let wait = max(resp.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 0, 120)
+                // The endpoint usually answers Retry-After: 0, which does NOT mean "retry
+                // now": retrying early keeps the throttle tripped. Back off exponentially
+                // (2, 4, 8, 16, then 30 min), honoring a larger Retry-After if given.
+                let ra = resp.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 0
+                let wait = max(ra, min(120 * pow(2, Double(backoffLevel)), 1800))
+                backoffLevel += 1
                 notBefore = Date().addingTimeInterval(wait)
-                status = "Rate limited, retry in \(Int((wait / 60).rounded(.up))) min" + staleSuffix()
+                apiFetchedAt = Date()   // don't let the poll timer re-fire before notBefore
+                status = rateLimitedStatus()
             default:
                 status = "HTTP \(code)" + staleSuffix()
             }
@@ -519,6 +605,124 @@ final class Store: ObservableObject {
             if s != stats { stats = s }
             scanning = false
         }
+    }
+}
+
+// MARK: - Claude Code status-line bridge
+
+// Claude Code passes `rate_limits` (5h/7d used % and reset time, taken from the
+// headers of its own API responses) to the status-line command on stdin, on every
+// update. With the bridge enabled, TokenTide's status-line script saves just that
+// object to a file and then runs your original status-line command unchanged, so
+// TokenTide gets live numbers without polling the rate-limited usage endpoint.
+// Enabling edits `statusLine` in ~/.claude/settings.json (a backup is kept);
+// disabling restores the original setting exactly.
+enum StatusLineBridge {
+    static let home = FileManager.default.homeDirectoryForCurrentUser
+    static let dir = home.appendingPathComponent(".claude/tokentide")
+    static let script = dir.appendingPathComponent("statusline.sh")
+    static let snapshot = dir.appendingPathComponent("rate_limits.json")
+    static let original = dir.appendingPathComponent("original-statusline.json")
+    static let settings = home.appendingPathComponent(".claude/settings.json")
+
+    struct Snapshot { let windows: [UsageWindow]; let at: Date }
+
+    static var isEnabled: Bool {
+        guard let cmd = (readSettings()?["statusLine"] as? [String: Any])?["command"] as? String else { return false }
+        return cmd.contains(script.path)
+    }
+
+    static func read() -> Snapshot? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: snapshot.path),
+              let at = attrs[.modificationDate] as? Date,
+              let data = try? Data(contentsOf: snapshot),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        var out: [UsageWindow] = []
+        for id in ["five_hour", "seven_day"] {
+            guard let w = obj[id] as? [String: Any],
+                  let pct = (w["used_percentage"] as? NSNumber)?.doubleValue else { continue }
+            let reset = (w["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+            out.append(UsageWindow(id: id, pct: pct, resetsAt: reset))
+        }
+        return out.isEmpty ? nil : Snapshot(windows: out, at: at)
+    }
+
+    static func enable() throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        var s = readSettings() ?? [:]
+        let current = s["statusLine"] as? [String: Any]
+        let currentCmd = current?["command"] as? String ?? ""
+        if !currentCmd.contains(script.path) {
+            // Remember whatever was there (possibly nothing) so disable() can restore it.
+            let saved: Any = current ?? NSNull()
+            try JSONSerialization.data(withJSONObject: ["statusLine": saved], options: [.prettyPrinted])
+                .write(to: original, options: .atomic)
+        }
+        try scriptBody(originalCommand: currentCmd.contains(script.path) ? savedCommand() : currentCmd)
+            .write(to: script, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        var line = current ?? [:]                      // keep padding / refreshInterval etc.
+        line["type"] = "command"
+        line["command"] = script.path
+        s["statusLine"] = line
+        try writeSettings(s)
+    }
+
+    static func disable() throws {
+        var s = readSettings() ?? [:]
+        let saved = (try? Data(contentsOf: original))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["statusLine"]
+        if let line = saved as? [String: Any] { s["statusLine"] = line } else { s.removeValue(forKey: "statusLine") }
+        try writeSettings(s)
+        try? FileManager.default.removeItem(at: snapshot)
+    }
+
+    private static func savedCommand() -> String {
+        let saved = (try? Data(contentsOf: original))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["statusLine"]
+        return (saved as? [String: Any])?["command"] as? String ?? ""
+    }
+
+    private static func readSettings() -> [String: Any]? {
+        guard let d = try? Data(contentsOf: settings) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+    }
+
+    private static func writeSettings(_ s: [String: Any]) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if fm.fileExists(atPath: settings.path) {
+            let backup = settings.appendingPathExtension("tokentide-backup")
+            try? fm.removeItem(at: backup)
+            try fm.copyItem(at: settings, to: backup)
+        }
+        try JSONSerialization.data(withJSONObject: s, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            .write(to: settings, options: .atomic)
+    }
+
+    // POSIX sh + plutil only (both ship with macOS). Stores nothing but rate_limits.
+    private static func scriptBody(originalCommand: String) -> String {
+        let quoted = "'" + originalCommand.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        return """
+        #!/bin/sh
+        # Written by TokenTide. Saves Claude Code's rate_limits for TokenTide, then runs
+        # your original status line. Disable from TokenTide's right-click menu.
+        input=$(cat)
+        dir="$HOME/.claude/tokentide"
+        if printf '%s' "$input" | /usr/bin/plutil -extract rate_limits json -o "$dir/.rl.tmp" - 2>/dev/null; then
+          mv -f "$dir/.rl.tmp" "$dir/rate_limits.json"
+        fi
+        orig=\(quoted)
+        if [ -n "$orig" ]; then
+          printf '%s' "$input" | /bin/sh -c "$orig"
+        else
+          f=$(printf '%s' "$input" | /usr/bin/plutil -extract rate_limits.five_hour.used_percentage raw -o - - 2>/dev/null)
+          w=$(printf '%s' "$input" | /usr/bin/plutil -extract rate_limits.seven_day.used_percentage raw -o - - 2>/dev/null)
+          [ -n "$f$w" ] && printf '5h %s%% · 7d %s%% used\\n' "${f%%.*}" "${w%%.*}"
+        fi
+        exit 0
+        """
     }
 }
 
@@ -794,6 +998,7 @@ final class LogIndex: @unchecked Sendable {
     func sum(since5h: Date, sinceDay: Date) -> TokenStats {
         var s = TokenStats()
         for e in entries {
+            if s.lastActivity.map({ e.t > $0 }) ?? true { s.lastActivity = e.t }
             if e.t >= since5h {
                 s.total5h += e.n
                 s.by5h[e.fam, default: 0] += e.n
@@ -858,7 +1063,10 @@ struct MeterView: View {
         .contentShape(shape)
         .help(store.updatedAt.map { "Updated \($0.formatted(date: .omitted, time: .standard))" } ?? "")
         .contextMenu {
-            Button("Refresh") { store.refresh(force: true) }
+            Button("Refresh") { store.refresh(manual: true) }
+            Button(store.bridgeEnabled ? "✓ Use Claude Code Status Line" : "Use Claude Code Status Line") {
+                store.toggleBridge()
+            }
             Button(SMAppService.mainApp.status == .enabled ? "✓ Launch at Login" : "Launch at Login") { toggleLogin() }
             Divider()
             Button("Quit") { NSApp.terminate(nil) }
