@@ -16,7 +16,7 @@ A tiny always-on-top macOS widget that shows how much of your Claude plan is lef
 
 ## Install
 
-**Download (recommended):** grab the latest [`TokenTide-vX.Y.Z.zip`](https://github.com/ychu824/TokenTide/releases/latest) (currently **v0.1.1**) from Releases, unzip it, and move `TokenTide.app` to `/Applications`. It's signed with a Developer ID and notarized by Apple, so it opens with a double-click.
+**Download (recommended):** grab the latest [`TokenTide-vX.Y.Z.zip`](https://github.com/ychu824/TokenTide/releases/latest) (currently **v0.1.2**) from Releases, unzip it, and move `TokenTide.app` to `/Applications`. It's signed with a Developer ID and notarized by Apple, so it opens with a double-click.
 
 **Or build from source:** needs Xcode Command Line Tools (`xcode-select --install`).
 
