@@ -379,7 +379,9 @@ final class Store: ObservableObject {
     @Published var panelSize = CGSize(width: 250, height: 150)
 
     private var token: String?
-    private var profileTried = false
+    private var profileAt = Date.distantPast           // last /api/oauth/profile check
+    private static let planKey = "TokenTide.plan"
+    private static let profileAtKey = "TokenTide.profileAt"
     private var timer: Timer?
     private var tokenTimer: Timer?
     private var busy = false
@@ -438,6 +440,8 @@ final class Store: ObservableObject {
             updatedAt = UserDefaults.standard.object(forKey: Self.cacheTimeKey) as? Date
         }
         let d = UserDefaults.standard
+        plan = d.string(forKey: Self.planKey)
+        profileAt = d.object(forKey: Self.profileAtKey) as? Date ?? .distantPast
         apiFetchedAt = d.object(forKey: Self.apiAtKey) as? Date ?? .distantPast
         notBefore = d.object(forKey: Self.notBeforeKey) as? Date ?? .distantPast
         backoffLevel = d.integer(forKey: Self.backoffKey)
@@ -541,6 +545,22 @@ final class Store: ObservableObject {
         return s
     }
 
+    // The plan in Claude Code's stored credentials is written at login and goes
+    // stale after an upgrade, so the profile endpoint is the source of truth.
+    // It changes rarely: check every 6 h, and on a manual Refresh after 10 min.
+    private var forcePlanCheck = false
+    private func refreshPlanIfDue(token: String) async {
+        let age = Date().timeIntervalSince(profileAt)
+        guard plan == nil || age > 6 * 3600 || (forcePlanCheck && age > 600) else { return }
+        forcePlanCheck = false
+        profileAt = Date()
+        UserDefaults.standard.set(profileAt, forKey: Self.profileAtKey)
+        if let p = await Profile.plan(token: token) {
+            plan = p
+            UserDefaults.standard.set(p, forKey: Self.planKey)
+        }
+    }
+
     private func persistTiming() {
         let d = UserDefaults.standard
         d.set(apiFetchedAt, forKey: Self.apiAtKey)
@@ -557,7 +577,7 @@ final class Store: ObservableObject {
     // only extends the throttle), but it does skip the normal poll interval.
     func refresh(manual: Bool = false) {
         let now = Date()
-        if manual { readBridge(); scanTokens() }
+        if manual { readBridge(); scanTokens(); forcePlanCheck = true }
         guard !busy else { return }
         guard now >= notBefore else {
             if manual { status = rateLimitedStatus(force: true) }
@@ -578,7 +598,7 @@ final class Store: ObservableObject {
             // Read once and keep it in memory; re-read only after a 401.
             let c = await Task.detached(priority: .utility) { Credentials.read() }.value
             token = c?.token
-            if let p = c?.plan { plan = p }
+            if plan == nil, let p = c?.plan { plan = p }   // fallback only; profile is authoritative
             if token == nil {
                 status = "No Claude Code login — run `claude` once"
                 return
@@ -602,10 +622,7 @@ final class Store: ObservableObject {
                 } else {
                     merge([], at: apiFetchedAt)   // caches only what's displayed, never the raw response
                 }
-                if plan == nil && !profileTried {
-                    profileTried = true
-                    plan = await Profile.plan(token: t)
-                }
+                await refreshPlanIfDue(token: t)
                 status = w.isEmpty ? "No limit fields in response (API changed?)" : nil
             case 401, 403:
                 token = nil   // re-read Keychain next round; Claude Code refreshes it when used
@@ -794,18 +811,20 @@ enum Credentials {
     }
 
     // "max" + "default_claude_max_20x" -> "Max 20x"; "pro" -> "Pro"; etc.
+    // Plan family from either field, plus a usage multiplier if the tier carries one:
+    // ("max", "default_claude_max_20x") -> "Max 20x"; ("ultra", …) -> "Ultra".
+    // The family is never inferred from the multiplier alone, so a new tier
+    // (e.g. Ultra) isn't mislabeled as Max.
     static func planName(sub: String?, tier: String?) -> String? {
         let t = (tier ?? "").lowercased()
         let s = (sub ?? "").lowercased()
-        if t.contains("20x") { return "Max 20x" }
-        if t.contains("5x") { return "Max 5x" }
         let both = s + " " + t
-        if both.contains("enterprise") { return "Enterprise" }
-        if both.contains("team") { return "Team" }
-        if both.contains("max") { return "Max" }
-        if both.contains("pro") { return "Pro" }
-        if both.contains("free") { return "Free" }
-        return s.isEmpty ? nil : s.capitalized
+        let families = ["enterprise", "team", "ultra", "max", "pro", "free"]
+        let family = families.first { both.contains($0) }?.capitalized
+            ?? (s.isEmpty ? nil : s.replacingOccurrences(of: "_", with: " ").capitalized)
+        guard let family else { return nil }
+        let mult = t.range(of: #"\d+x"#, options: .regularExpression).map { " " + t[$0] } ?? ""
+        return family + mult
     }
 
     // Same mechanism Claude Code itself uses, so the item's ACL already trusts it
