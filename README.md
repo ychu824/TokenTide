@@ -55,7 +55,7 @@ The widget floats above every window, on every Space and over full-screen apps. 
 
 | What | Source | Refresh |
 |---|---|---|
-| Limit % and reset times | Claude Code's status line (optional, see below), otherwise `GET api.anthropic.com/api/oauth/usage` with Claude Code's OAuth token | live via status line; otherwise every 5 min while Claude Code is active, 15 min when idle, and when you hover over stale data |
+| Limit % and reset times | Claude Code's status line (optional, see below), otherwise `GET api.anthropic.com/api/oauth/usage` with Claude Code's OAuth token | live via status line; otherwise every 10 min while Claude Code is active, 30 min when idle, and when you hover over data older than 15 min |
 | Plan name | `subscriptionType` / `rateLimitTier` in the Keychain entry, with `/api/oauth/profile` as a fallback | once |
 | Tokens and model mix | Claude Code's session logs, `~/.claude/projects/**/*.jsonl` | every 5 s, and when you hover |
 
@@ -64,7 +64,7 @@ The widget floats above every window, on every Space and over full-screen apps. 
 - **Token counting.** Tokens are input + output + cache writes. Cache reads are excluded.
 - **Token share is not limit share.** Opus and Fable tokens weigh more against your limits than Sonnet tokens.
 - **Log reading is incremental.** TokenTide keeps a byte offset per file and parses only new lines, so a scan takes milliseconds.
-- **Rate limits.** Anthropic throttles the usage endpoint hard, and the limit is shared with Claude Code's own `/usage`. TokenTide polls adaptively, and on a 429 backs off exponentially (2 → 4 → 8 → 16 → 30 min) while keeping the last numbers on screen.
+- **Rate limits.** Anthropic throttles the usage endpoint hard, and the limit is shared with Claude Code's own `/usage`. TokenTide asks rarely, backs off on a 429 (10 → 20 → 40 → 60 min, remembered across relaunches), and keeps showing the last numbers with their age in the footer. It only shows an error if the data is more than an hour old.
 
 ### Live numbers with no polling (recommended)
 

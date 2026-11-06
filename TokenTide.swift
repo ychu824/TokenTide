@@ -392,6 +392,26 @@ final class Store: ObservableObject {
     @Published var bridgeEnabled = StatusLineBridge.isEnabled
     private static let cacheKey = "TokenTide.limits"   // minimal: [{id, pct, resetsAt}]
     private static let cacheTimeKey = "TokenTide.limitsAt"
+    // Persisted so a relaunch (or rebuild) neither refetches fresh data nor
+    // escapes an active backoff.
+    private static let apiAtKey = "TokenTide.apiFetchedAt"
+    private static let notBeforeKey = "TokenTide.notBefore"
+    private static let backoffKey = "TokenTide.backoffLevel"
+
+    // Timing policy. The usage endpoint's throttle is per account, shared with
+    // Claude Code's own /usage, and once tripped it tends to stay tripped for a
+    // long time, so everything here errs on the side of asking rarely.
+    private enum Policy {
+        static let pollActive: TimeInterval = 600       // Claude Code used in the last 15 min
+        static let pollIdle: TimeInterval = 1800
+        static let pollWithBridge: TimeInterval = 3600  // status line already gives live 5h/7d
+        static let hoverStale: TimeInterval = 900       // opening the panel refetches only if older
+        static let minGap: TimeInterval = 120           // between any two automatic attempts
+        static let manualGap: TimeInterval = 60         // between two manual Refreshes
+        static let backoffBase: TimeInterval = 600      // 429: 10, 20, 40, then 60 min
+        static let backoffMax: TimeInterval = 3600
+        static let quietFor: TimeInterval = 3600        // don't complain while data is younger than this
+    }
     private var scanning = false
     private let logIndex = LogIndex()
 
@@ -414,9 +434,14 @@ final class Store: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: Self.cacheKey),
            let cached = try? JSONDecoder().decode([UsageWindow].self, from: data) {
             windows = cached
+            apiWindows = cached
             updatedAt = UserDefaults.standard.object(forKey: Self.cacheTimeKey) as? Date
-            expireWindows()
         }
+        let d = UserDefaults.standard
+        apiFetchedAt = d.object(forKey: Self.apiAtKey) as? Date ?? .distantPast
+        notBefore = d.object(forKey: Self.notBeforeKey) as? Date ?? .distantPast
+        backoffLevel = d.integer(forKey: Self.backoffKey)
+        expireWindows()
         readBridge()
         scanTokens()
         tick()
@@ -442,14 +467,14 @@ final class Store: ObservableObject {
     //  - Otherwise (idle, or only using claude.ai): 15 min.
     private var pollInterval: TimeInterval {
         let now = Date()
-        if now.timeIntervalSince(bridgeAt) < 600 { return 1800 }
-        if let a = stats.lastActivity, now.timeIntervalSince(a) < 900 { return 300 }
-        return 900
+        if now.timeIntervalSince(bridgeAt) < 600 { return Policy.pollWithBridge }
+        if let a = stats.lastActivity, now.timeIntervalSince(a) < 900 { return Policy.pollActive }
+        return Policy.pollIdle
     }
 
     // Called when the panel opens: fetch only if what's on screen is getting old.
     func refreshIfStale() {
-        if Date().timeIntervalSince(max(apiFetchedAt, bridgeAt)) > 180 { refresh() }
+        if Date().timeIntervalSince(max(apiFetchedAt, bridgeAt)) > Policy.hoverStale { refresh() }
     }
 
     // MARK: Status-line bridge
@@ -474,7 +499,7 @@ final class Store: ObservableObject {
             UserDefaults.standard.set(enc, forKey: Self.cacheKey)
             UserDefaults.standard.set(updatedAt, forKey: Self.cacheTimeKey)
         }
-        if status?.hasPrefix("Rate limited") == true && Date().timeIntervalSince(at) < 600 { status = nil }
+        if Date().timeIntervalSince(at) < 600, status?.hasPrefix("Rate limited") == true || status?.hasPrefix("Can't reach") == true { status = nil }
     }
 
     func toggleBridge() {
@@ -490,20 +515,37 @@ final class Store: ObservableObject {
 
     // A window whose reset time has passed is, by definition, fresh again. Show it as
     // 0% used instead of the stale pre-reset number, and fetch the new state.
+    // Applied to the API copy too: otherwise the next merge() would bring the stale
+    // pre-reset value back, re-trigger this, and retry every minute.
     private func expireWindows() {
         let now = Date()
-        guard windows.contains(where: { ($0.resetsAt ?? .distantFuture) <= now }) else { return }
-        windows = windows.map { w in
-            (w.resetsAt ?? .distantFuture) <= now ? UsageWindow(id: w.id, pct: 0, resetsAt: nil) : w
+        func expire(_ ws: [UsageWindow]) -> [UsageWindow] {
+            ws.map { ($0.resetsAt ?? .distantFuture) <= now ? UsageWindow(id: $0.id, pct: 0, resetsAt: nil) : $0 }
         }
-        refresh()   // subject to backoff like any other fetch
+        guard windows.contains(where: { ($0.resetsAt ?? .distantFuture) <= now }) else { return }
+        windows = expire(windows)
+        apiWindows = expire(apiWindows)
+        // One fetch for the new window's reset time, but only if it can't trip the throttle.
+        if now >= notBefore && now.timeIntervalSince(lastAttempt) > Policy.hoverStale { refresh() }
     }
 
-    private func rateLimitedStatus() -> String {
+    // Throttling is normal and mostly invisible: while the numbers on screen are
+    // under an hour old we just keep showing them (the footer says how old). Only
+    // a long outage, or a manual Refresh, surfaces it.
+    private func rateLimitedStatus(force: Bool = false) -> String? {
+        let age = updatedAt.map { Date().timeIntervalSince($0) } ?? .infinity
+        guard force || age > Policy.quietFor else { return nil }
         let mins = max(1, Int((notBefore.timeIntervalSinceNow / 60).rounded(.up)))
-        var s = "Rate limited, retry in \(mins) min" + staleSuffix()
+        var s = "Rate limited by Anthropic, next try in \(mins) min"
         if !bridgeEnabled { s += " · Tip: right-click → Use Claude Code Status Line" }
         return s
+    }
+
+    private func persistTiming() {
+        let d = UserDefaults.standard
+        d.set(apiFetchedAt, forKey: Self.apiAtKey)
+        d.set(notBefore, forKey: Self.notBeforeKey)
+        d.set(backoffLevel, forKey: Self.backoffKey)
     }
 
     private func staleSuffix() -> String {
@@ -518,10 +560,10 @@ final class Store: ObservableObject {
         if manual { readBridge(); scanTokens() }
         guard !busy else { return }
         guard now >= notBefore else {
-            if manual { status = rateLimitedStatus() }
+            if manual { status = rateLimitedStatus(force: true) }
             return
         }
-        guard manual || now.timeIntervalSince(lastAttempt) >= 60 else { return }
+        guard now.timeIntervalSince(lastAttempt) >= (manual ? Policy.manualGap : Policy.minGap) else { return }
         lastAttempt = now
         busy = true
         Task {
@@ -550,8 +592,10 @@ final class Store: ObservableObject {
             case 200:
                 let w = Parser.windows(from: try JSONSerialization.jsonObject(with: data))
                 backoffLevel = 0
+                notBefore = .distantPast
                 apiFetchedAt = Date()
                 apiWindows = w
+                persistTiming()
                 // A fresher status-line snapshot keeps priority for 5h/7d.
                 if bridgeEnabled, let snap = StatusLineBridge.read(), snap.at > apiFetchedAt.addingTimeInterval(-60) {
                     merge(snap.windows, at: snap.at)
@@ -569,18 +613,25 @@ final class Store: ObservableObject {
             case 429:
                 // The endpoint usually answers Retry-After: 0, which does NOT mean "retry
                 // now": retrying early keeps the throttle tripped. Back off exponentially
-                // (2, 4, 8, 16, then 30 min), honoring a larger Retry-After if given.
+                // (10, 20, 40, then 60 min), honoring a larger Retry-After if given.
                 let ra = resp.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 0
-                let wait = max(ra, min(120 * pow(2, Double(backoffLevel)), 1800))
-                backoffLevel += 1
+                let wait = max(ra, min(Policy.backoffBase * pow(2, Double(backoffLevel)), Policy.backoffMax))
+                backoffLevel = min(backoffLevel + 1, 6)
                 notBefore = Date().addingTimeInterval(wait)
                 apiFetchedAt = Date()   // don't let the poll timer re-fire before notBefore
+                persistTiming()
                 status = rateLimitedStatus()
             default:
-                status = "HTTP \(code)" + staleSuffix()
+                apiFetchedAt = Date()
+                persistTiming()
+                if (updatedAt.map { Date().timeIntervalSince($0) } ?? .infinity) > Policy.quietFor {
+                    status = "Can't reach Anthropic (HTTP \(code))"
+                }
             }
         } catch {
-            status = "Network error" + staleSuffix()
+            if (updatedAt.map { Date().timeIntervalSince($0) } ?? .infinity) > Policy.quietFor {
+                status = "Can't reach Anthropic (offline?)"
+            }
         }
     }
 
@@ -1113,7 +1164,7 @@ struct ExpandedPanel: View {
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                Text(verbatim: "tok  5h \(fmt(store.stats.total5h)) · today \(fmt(store.stats.totalDay))")
+                Text(verbatim: "tok  5h \(fmt(store.stats.total5h)) · today \(fmt(store.stats.totalDay))" + ageText(store.updatedAt, now: ctx.date))
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.tertiary)
             }
@@ -1162,6 +1213,17 @@ struct Gauge: View {
                 .rotationEffect(.degrees(-90))
         }
         .frame(width: diameter, height: diameter)
+    }
+}
+
+// " · 12m ago" for the panel footer; nothing when the data is fresh.
+func ageText(_ d: Date?, now: Date) -> String {
+    guard let d else { return "" }
+    let m = Int(now.timeIntervalSince(d) / 60)
+    switch m {
+    case ..<2:   return ""
+    case ..<60:  return " · \(m)m ago"
+    default:     return " · \(m / 60)h ago"
     }
 }
 
