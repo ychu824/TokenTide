@@ -1112,8 +1112,7 @@ struct MeterView: View {
                 ExpandedPanel(store: store)
                     .transition(.opacity)
             } else {
-                Gauge(fiveHour: store.windows.first { $0.id == "five_hour" },
-                      sevenDay: store.windows.first { $0.id == "seven_day" },
+                Gauge(windows: store.windows,
                       failed: store.windows.isEmpty && store.status != nil)
                     .transition(.opacity)
             }
@@ -1195,40 +1194,49 @@ struct ExpandedPanel: View {
     }
 }
 
-// Collapsed state: two concentric rings, filled clockwise by % left.
-// Outer ring = 5h window, inner ring = 7d window, center = 5h % left.
+// Collapsed state: up to two concentric rings, filled clockwise by % left, for
+// the first two limits the account actually has (in order: 5h, 7d, 7d Opus,
+// 7d Sonnet). Plans without a 5-hour limit (e.g. Ultra) get 7d on the outer ring.
+// Center = % left of the outer ring.
 struct Gauge: View {
-    let fiveHour: UsageWindow?
-    let sevenDay: UsageWindow?
+    let windows: [UsageWindow]
     let failed: Bool
+
+    private var outer: UsageWindow? { windows.first }
+    private var inner: UsageWindow? { windows.dropFirst().first }
 
     var body: some View {
         ZStack {
-            ring(fiveHour, diameter: 36)
-            ring(sevenDay, diameter: 24)
+            if inner == nil {
+                ring(outer, diameter: 34, width: 6)   // single limit: one bolder ring
+            } else {
+                ring(outer, diameter: 36, width: 4)
+                ring(inner, diameter: 24, width: 4)
+            }
             Text(verbatim: center)
                 .font(.system(size: 9, weight: .bold, design: .rounded))
                 .monospacedDigit()
                 .foregroundStyle(failed ? Color.secondary : Color.primary)
         }
         .frame(width: gaugeSize, height: gaugeSize)
+        .help(windows.prefix(2).map { "\($0.label): \(Int(left($0).rounded()))% left" }.joined(separator: " · "))
     }
 
     private var center: String {
         if failed { return "!" }
-        guard let w = fiveHour else { return "–" }
+        guard let w = outer else { return "–" }
         return "\(Int(left(w).rounded()))"
     }
 
     private func left(_ w: UsageWindow) -> Double { min(100, max(0, 100 - w.pct)) }
 
-    private func ring(_ w: UsageWindow?, diameter: CGFloat) -> some View {
+    private func ring(_ w: UsageWindow?, diameter: CGFloat, width: CGFloat) -> some View {
         let l = w.map(left) ?? 0
         return ZStack {
-            Circle().stroke(Color.primary.opacity(0.15), lineWidth: 4)
+            Circle().stroke(Color.primary.opacity(0.15), lineWidth: width)
             Circle()
                 .trim(from: 0, to: l / 100)
-                .stroke(leftColor(l), style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                .stroke(leftColor(l), style: StrokeStyle(lineWidth: width, lineCap: .round))
                 .rotationEffect(.degrees(-90))
         }
         .frame(width: diameter, height: diameter)

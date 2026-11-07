@@ -10,7 +10,9 @@ A tiny always-on-top macOS widget that shows how much of your Claude plan is lef
 
 - the outer ring is the 5-hour window
 - the inner ring is the 7-day window
-- the number in the center is the 5-hour % left
+- the number in the center is the outer ring's % left
+
+On plans without a 5-hour limit (such as Ultra), it shows a single ring for the 7-day window.
 
 **Hover** over it and it morphs into the full panel. Move the pointer away and it shrinks back.
 
