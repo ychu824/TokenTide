@@ -63,7 +63,9 @@ echo "==> Publish"
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
   gh release upload "$TAG" "$ZIP" SHA256SUMS.txt --repo "$REPO" --clobber
 else
-  gh release create "$TAG" "$ZIP" SHA256SUMS.txt --repo "$REPO" --title "TokenTide $TAG" --generate-notes
+  NOTES=(--generate-notes)
+  [[ -f "docs/releases/$TAG.md" ]] && NOTES=(--notes-file "docs/releases/$TAG.md")
+  gh release create "$TAG" "$ZIP" SHA256SUMS.txt --repo "$REPO" --title "TokenTide $TAG" "${NOTES[@]}"
 fi
 echo "Done: https://github.com/$REPO/releases/tag/$TAG"
 }
