@@ -1348,6 +1348,9 @@ struct ModelShare: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
+            Text(verbatim: "Model mix · Claude Code only")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.tertiary)
             bar("5h", s.by5h, s.total5h)
             bar("day", s.byDay, s.totalDay)
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4, alignment: .leading), count: 3),
