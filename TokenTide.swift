@@ -305,9 +305,10 @@ struct UsageWindow: Identifiable, Codable {
         switch id {
         case "five_hour": return "5h"
         case "seven_day": return "7d"
-        case "seven_day_opus": return "7d Opus"
         case "seven_day_sonnet": return "7d Son."
-        default: return id
+        default:
+            if id.hasPrefix("seven_day_") { return "7d " + id.dropFirst(10).capitalized }
+            return id
         }
     }
 }
@@ -321,7 +322,11 @@ struct TokenStats: Equatable {
 }
 
 enum Family {
-    static let order = ["Opus", "Sonnet", "Fable", "Haiku", "Other"]
+    // Known families keep a fixed position and color. Anything else is named from
+    // its model id ("claude-<family>-…"), so a new model appears as its own family
+    // instead of disappearing into "Other".
+    static let known = ["Opus", "Sonnet", "Fable", "Haiku"]
+    static let modelWords: Set<String> = ["opus", "sonnet", "fable", "mythos", "haiku"]
 
     static func of(_ model: String?) -> String {
         let m = (model ?? "").lowercased()
@@ -329,7 +334,18 @@ enum Family {
         if m.contains("sonnet") { return "Sonnet" }
         if m.contains("fable") || m.contains("mythos") { return "Fable" }
         if m.contains("haiku") { return "Haiku" }
+        // claude-<family>-5-2, claude-<family>-5-2-20261101, …
+        if let r = m.range(of: #"^claude-([a-z]+)-"#, options: .regularExpression) {
+            let fam = m[r].dropFirst(7).dropLast()
+            if !fam.isEmpty { return fam.capitalized }
+        }
         return "Other"
+    }
+
+    // Known first, then new families by usage, "Other" last.
+    static func ordered(_ fams: [String], weight: (String) -> Int) -> [String] {
+        let new = fams.filter { !known.contains($0) && $0 != "Other" }.sorted { weight($0) > weight($1) }
+        return known.filter(fams.contains) + new + (fams.contains("Other") ? ["Other"] : [])
     }
 
     static func color(_ f: String) -> Color {
@@ -340,7 +356,12 @@ enum Family {
         case "Sonnet": return hex(0x4269D0)   // blue
         case "Fable":  return hex(0xEFB118)   // yellow
         case "Haiku":  return hex(0x6CC5B0)   // teal
-        default:       return hex(0x9498A0)   // gray
+        case "Other":  return hex(0x9498A0)   // gray
+        default:
+            // Unknown family: a stable pick from the rest of the palette.
+            let rest: [UInt32] = [0xFF725C, 0x3CA951, 0xFF8AB7, 0x97BBF5, 0x9C6B4E]
+            let h = f.unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) & 0x7fffffff }
+            return hex(rest[h % rest.count])
         }
     }
 }
@@ -494,8 +515,8 @@ final class Store: ObservableObject {
     private func merge(_ fresh: [UsageWindow], at: Date) {
         var byId = Dictionary(uniqueKeysWithValues: apiWindows.map { ($0.id, $0) })
         for w in fresh { byId[w.id] = w }
-        let order = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]
-        let merged = order.compactMap { byId[$0] }
+        let merged = byId.values.filter { Parser.isShown($0.id) }
+            .sorted { (Parser.rank($0.id), $0.id) < (Parser.rank($1.id), $1.id) }
         guard !merged.isEmpty else { return }
         windows = merged
         updatedAt = max(updatedAt ?? .distantPast, at)
@@ -934,7 +955,23 @@ enum Profile {
 enum Parser {
     // Only these keys are shown, in this order. Anything else in the response
     // (internal codenames like "iguana_necktie", extra_usage, ...) is ignored.
-    private static let known = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]
+    // Plus seven_day_<model family> (opus, sonnet, fable, …). Other seven_day_*
+    // keys are product codenames (omelette, cowork, oauth_apps) and stay hidden.
+    static func isShown(_ id: String) -> Bool {
+        if id == "five_hour" || id == "seven_day" { return true }
+        guard id.hasPrefix("seven_day_") else { return false }
+        return Family.modelWords.contains(String(id.dropFirst(10)))
+    }
+
+    static func rank(_ id: String) -> Int {
+        switch id {
+        case "five_hour": return 0
+        case "seven_day": return 1
+        case "seven_day_opus": return 2
+        case "seven_day_sonnet": return 3
+        default: return 4
+        }
+    }
 
     private static let isoFrac: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -955,7 +992,8 @@ enum Parser {
     static func windows(from obj: Any) -> [UsageWindow] {
         var out: [String: UsageWindow] = [:]
         walk(obj, key: nil, &out)
-        return known.compactMap { out[$0] }
+        return out.values.filter { isShown($0.id) }
+            .sorted { (rank($0.id), $0.id) < (rank($1.id), $1.id) }
     }
 
     private static func walk(_ obj: Any, key: String?, _ out: inout [String: UsageWindow]) {
@@ -1270,12 +1308,12 @@ struct WindowRow: View {
         let left = min(100, max(0, 100 - w.pct))
         HStack(spacing: 6) {
             Text(verbatim: w.label)
-                .frame(width: 52, alignment: .leading)
+                .frame(width: 60, alignment: .leading)
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.primary.opacity(0.15))
-                Capsule().fill(leftColor(left)).frame(width: 56 * left / 100)
+                Capsule().fill(leftColor(left)).frame(width: 48 * left / 100)
             }
-            .frame(width: 56, height: 6)
+            .frame(width: 48, height: 6)
             Text(verbatim: "\(Int(left.rounded()))% left")
                 .frame(width: 60, alignment: .trailing)
             Text(verbatim: countdown())
@@ -1304,7 +1342,8 @@ struct ModelShare: View {
     private let barWidth: CGFloat = contentWidth - 40
 
     private var present: [String] {
-        Family.order.filter { (s.byDay[$0] ?? 0) > 0 || (s.by5h[$0] ?? 0) > 0 }
+        let fams = Set(s.byDay.keys).union(s.by5h.keys).filter { (s.byDay[$0] ?? 0) > 0 || (s.by5h[$0] ?? 0) > 0 }
+        return Family.ordered(Array(fams)) { s.byDay[$0] ?? 0 }
     }
 
     var body: some View {
