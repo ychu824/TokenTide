@@ -10,9 +10,10 @@ TokenTide reads an OAuth token that can act on your Claude account, so here is e
 | `~/.claude/projects/**/*.jsonl` | read | To get Claude Code token counts and the model mix |
 | `https://api.anthropic.com/api/oauth/usage` and `/api/oauth/profile` | HTTPS GET | To get limit percentages, reset times and the plan |
 | `~/.claude/settings.json`, `~/.claude/tokentide/` | read and write, **only if you enable "Use Claude Code Status Line"** | Points `statusLine` at TokenTide's script, which stores only the `rate_limits` object Claude Code passes it. The original setting is saved and restored when you turn it off |
+| `https://api.github.com/repos/ychu824/TokenTide/releases/latest` and the release download (`github.com` → `*.githubusercontent.com`) | HTTPS GET, every 6 h | Updates. No credentials are sent. An update installs only if it passes `codesign --verify --deep --strict`, is signed by the same Developer ID team as the running app, and passes Gatekeeper (notarized). Turn off auto-install in the menu |
 | App `UserDefaults` (`io.github.ychu824.TokenTide`) | read and write | Stores the widget position and the last limit percentages and reset times |
 
-**Nothing else.** There is no analytics, no telemetry, no update checker and no third-party host.
+**Nothing else.** There is no analytics, no telemetry and no other host. Your Claude token is only ever sent to `api.anthropic.com`, never to GitHub.
 
 ## How the token is protected
 

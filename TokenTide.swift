@@ -93,6 +93,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var collapseTask: Task<Void, Never>?
 
     private var home = NSPoint.zero
+    private var lastGauge = gaugeSize
+    private var updaterBag: AnyCancellable?
     private var windowIsExpanded = false
     private var programmaticMove = false
     private var gen = 0
@@ -131,6 +133,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         bag = store.objectWillChange.sink { [weak self] _ in
             // objectWillChange fires before the change; yield so SwiftUI has applied it.
+            Task { @MainActor in
+                await Task.yield()
+                self?.relayout()
+            }
+        }
+        updaterBag = Updater.shared.objectWillChange.sink { [weak self] _ in
             Task { @MainActor in
                 await Task.yield()
                 self?.relayout()
@@ -200,6 +208,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // Only user drags get here. Re-derive `home` from the anchored corner and persist.
+    // Ring size changed: keep the corner nearest the screen corner fixed, so the
+    // ring grows toward the middle of the screen, then persist the new origin.
+    private func resizeGauge() {
+        let old = NSRect(origin: home, size: NSSize(width: lastGauge, height: lastGauge))
+        let vf = visibleFrame, new = gaugeSize
+        home.x = old.midX > vf.midX ? old.maxX - new : old.minX
+        home.y = old.midY > vf.midY ? old.maxY - new : old.minY
+        home.x = min(max(home.x, vf.minX), vf.maxX - new)
+        home.y = min(max(home.y, vf.minY), vf.maxY - new)
+        lastGauge = new
+        UserDefaults.standard.set(NSStringFromPoint(home), forKey: Self.homeKey)
+        if !windowIsExpanded { setWindow(content: circleRect) }
+    }
+
     private func windowMoved() {
         guard !programmaticMove else { return }
         let r = contentRect
@@ -263,6 +285,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Keeps the window matched to content changes (e.g. a new limit row appears while
     // open). Skips mid-transition.
     private func relayout() {
+        if gaugeSize != lastGauge { resizeGauge() }
         guard store.open == windowIsExpanded else { return }
         if windowIsExpanded {
             let size = measuredPanelSize()
@@ -300,6 +323,12 @@ struct UsageWindow: Identifiable, Codable {
     let id: String          // API key, e.g. "five_hour"
     let pct: Double         // % used, 0–100
     let resetsAt: Date?
+
+    // Per-model weekly limits (7d Fable, 7d Opus, …) are secondary: they only
+    // appear in the panel once more than half used, never on the ring, and don't
+    // drive the mood. The plan-wide 5h/7d limits are what actually stop you.
+    var isScoped: Bool { id != "five_hour" && id != "seven_day" }
+    var isVisible: Bool { !isScoped || pct > 50 }
 
     var label: String {
         switch id {
@@ -413,6 +442,9 @@ final class Store: ObservableObject {
     private var apiFetchedAt = Date.distantPast
     private var bridgeAt = Date.distantPast            // mtime of the last status-line snapshot used
     @Published var bridgeEnabled = StatusLineBridge.isEnabled
+    @Published var size = WidgetSize.current {
+        didSet { WidgetSize.current = size }
+    }
     private static let cacheKey = "TokenTide.limits"   // minimal: [{id, pct, resetsAt}]
     private static let cacheTimeKey = "TokenTide.limitsAt"
     // Persisted so a relaunch (or rebuild) neither refetches fresh data nor
@@ -438,9 +470,10 @@ final class Store: ObservableObject {
     private var scanning = false
     private let logIndex = LogIndex()
 
-    // Driven by the tightest limit (lowest % left across all windows).
+    // Driven by the tightest plan-wide limit (per-model limits don't stop you).
     var mood: Mood {
-        guard let minLeft = windows.map({ 100 - $0.pct }).min() else {
+        let main = windows.filter { !$0.isScoped }
+        guard let minLeft = (main.isEmpty ? windows : main).map({ 100 - $0.pct }).min() else {
             return status == nil ? .loading : .offline
         }
         switch minLeft {
@@ -479,6 +512,7 @@ final class Store: ObservableObject {
     }
 
     private func tick() {
+        Updater.shared.checkIfDue()
         expireWindows()
         readBridge()
         scanTokens()
@@ -693,6 +727,245 @@ final class Store: ObservableObject {
             }.value
             if s != stats { stats = s }
             scanning = false
+        }
+    }
+}
+
+// MARK: - Updates
+
+// Self-updater for release builds. Every 6 h it asks GitHub for the latest release
+// of this repo; if it's newer, it downloads TokenTide-vX.Y.Z.zip, and installs it
+// only if the new app passes `codesign --verify --deep --strict`, is signed by the
+// same Developer ID team as the running app, and passes Gatekeeper (notarized).
+// It then swaps the bundle in place and relaunches. Hosts: api.github.com,
+// github.com, *.githubusercontent.com. Local builds (version 0.0.0-dev) never update.
+@MainActor
+final class Updater: ObservableObject {
+    static let shared = Updater()
+    static let repo = "ychu824/TokenTide"
+
+    @Published var available: String?      // newer version found, e.g. "0.1.4"
+    @Published var message: String?        // shown in the panel
+    @Published var busy = false
+    @Published var autoInstall = UserDefaults.standard.object(forKey: "TokenTide.autoUpdate") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(autoInstall, forKey: "TokenTide.autoUpdate") }
+    }
+    private var asset: URL?
+    private var lastCheck = UserDefaults.standard.object(forKey: "TokenTide.updateCheckedAt") as? Date ?? .distantPast
+
+    static var current: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0" }
+    static var isDevBuild: Bool { current.hasPrefix("0.0.0") }
+
+    func checkIfDue() {
+        guard !busy, !Self.isDevBuild, Date().timeIntervalSince(lastCheck) > 6 * 3600 else { return }
+        Task { await check(manual: false) }
+    }
+
+    func check(manual: Bool) async {
+        guard !busy else { return }
+        lastCheck = Date()
+        UserDefaults.standard.set(lastCheck, forKey: "TokenTide.updateCheckedAt")
+        if Self.isDevBuild {
+            if manual { message = "Local build (\(Self.current)) — updates are off" }
+            return
+        }
+        guard let rel = await UpdateNet.latestRelease(repo: Self.repo) else {
+            if manual { message = "Couldn't check for updates" }
+            return
+        }
+        let (tag, url) = rel
+        let v = String(tag.drop { $0 == "v" })
+        guard Self.isNewer(v, than: Self.current) else {
+            available = nil
+            if manual { message = "TokenTide \(Self.current) is up to date" }
+            return
+        }
+        available = v
+        asset = url
+        message = nil
+        if autoInstall || manual { await install() }
+    }
+
+    func install() async {
+        guard let asset, let v = available, !busy else { return }
+        let dest = Bundle.main.bundleURL
+        if dest.path.contains("/AppTranslocation/") {
+            message = "Move TokenTide to Applications to enable updates"
+            return
+        }
+        guard FileManager.default.isWritableFile(atPath: dest.deletingLastPathComponent().path) else {
+            message = "Update \(v) available — no permission to replace \(dest.path)"
+            return
+        }
+        busy = true
+        message = "Installing \(v)…"
+        let result = await Task.detached(priority: .utility) { () -> Result<URL, UpdateError> in
+            Self.prepare(asset: asset, version: v, replacing: dest)
+        }.value
+        busy = false
+        switch result {
+        case .failure(let e):
+            message = "Update \(v) failed: \(e.text)"
+        case .success(let newApp):
+            Self.swapAndRelaunch(newApp: newApp, dest: dest)
+        }
+    }
+
+    struct UpdateError: Error { let text: String }
+
+    // Download, unzip and verify. Runs off the main thread.
+    nonisolated private static func prepare(asset: URL, version: String, replacing dest: URL) -> Result<URL, UpdateError> {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("TokenTide-update-\(UUID().uuidString)")
+        do { try fm.createDirectory(at: dir, withIntermediateDirectories: true) } catch {
+            return .failure(UpdateError(text: "temp dir"))
+        }
+        let zip = dir.appendingPathComponent("u.zip")
+        guard UpdateNet.download(asset, to: zip) else { return .failure(UpdateError(text: "download")) }
+        guard run("/usr/bin/ditto", ["-x", "-k", zip.path, dir.path]).0 == 0 else {
+            return .failure(UpdateError(text: "unzip"))
+        }
+        let app = dir.appendingPathComponent("TokenTide.app")
+        guard run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path]).0 == 0 else {
+            return .failure(UpdateError(text: "signature invalid"))
+        }
+        guard let mine = teamID(dest), let theirs = teamID(app), mine == theirs else {
+            return .failure(UpdateError(text: "not signed by the same developer"))
+        }
+        guard run("/usr/sbin/spctl", ["--assess", "--type", "execute", app.path]).0 == 0 else {
+            return .failure(UpdateError(text: "not notarized"))
+        }
+        let got = (NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))?["CFBundleShortVersionString"] as? String) ?? ""
+        guard got == version else { return .failure(UpdateError(text: "version mismatch")) }
+        return .success(app)
+    }
+
+    // Wait for this process to exit, swap the bundle (restoring the old one if the
+    // move fails), relaunch.
+    private static func swapAndRelaunch(newApp: URL, dest: URL) {
+        let script = """
+        i=0; while kill -0 "$1" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+        old="$3.tokentide-old"; rm -rf "$old"
+        if mv "$3" "$old"; then
+          if mv "$2" "$3"; then rm -rf "$old"; else mv "$old" "$3"; fi
+        fi
+        open "$3"
+        """
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", script, "tokentide-update", String(ProcessInfo.processInfo.processIdentifier), newApp.path, dest.path]
+        do { try p.run() } catch { return }
+        NSApp.terminate(nil)
+    }
+
+    nonisolated private static func teamID(_ app: URL) -> String? {
+        let (code, out) = run("/usr/bin/codesign", ["-dv", "--verbose=2", app.path])
+        guard code == 0 else { return nil }
+        for line in out.split(separator: "\n") where line.hasPrefix("TeamIdentifier=") {
+            let t = String(line.dropFirst("TeamIdentifier=".count))
+            return t == "not set" ? nil : t
+        }
+        return nil
+    }
+
+    nonisolated private static func run(_ path: String, _ args: [String]) -> (Int32, String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return (-1, "") }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        func parts(_ s: String) -> [Int] { s.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 } }
+        let x = parts(a), y = parts(b)
+        for i in 0..<max(x.count, y.count) {
+            let l = i < x.count ? x[i] : 0, r = i < y.count ? y[i] : 0
+            if l != r { return l > r }
+        }
+        return false
+    }
+}
+
+// GitHub networking for the updater only. HTTPS to api.github.com / github.com /
+// *.githubusercontent.com (release downloads redirect there); other redirects are refused.
+enum UpdateNet {
+    static func allowed(_ u: URL?) -> Bool {
+        guard let u, u.scheme == "https", let h = u.host else { return false }
+        return h == "api.github.com" || h == "github.com" || h.hasSuffix(".githubusercontent.com")
+    }
+
+    private final class Guard: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(UpdateNet.allowed(request.url) ? request : nil)
+        }
+    }
+
+    private static let session: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.urlCache = nil
+        c.httpCookieStorage = nil
+        c.timeoutIntervalForRequest = 30
+        c.httpAdditionalHeaders = ["User-Agent": "TokenTide-Updater"]
+        return URLSession(configuration: c, delegate: Guard(), delegateQueue: nil)
+    }()
+
+    static func latestRelease(repo: String) async -> (String, URL)? {
+        guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else { return nil }
+        var req = URLRequest(url: url)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        guard let r = try? await session.data(for: req),
+              (r.1 as? HTTPURLResponse)?.statusCode == 200,
+              let o = (try? JSONSerialization.jsonObject(with: r.0)) as? [String: Any],
+              let tag = o["tag_name"] as? String,
+              let assets = o["assets"] as? [[String: Any]],
+              let a = assets.first(where: { ($0["name"] as? String) == "TokenTide-\(tag).zip" }),
+              let s = a["browser_download_url"] as? String, let dl = URL(string: s), allowed(dl) else { return nil }
+        return (tag, dl)
+    }
+
+    // Blocking download for use off the main thread.
+    static func download(_ url: URL, to dest: URL) -> Bool {
+        let sem = DispatchSemaphore(value: 0)
+        var ok = false
+        let task = session.downloadTask(with: url) { tmp, resp, _ in
+            defer { sem.signal() }
+            guard let tmp, (resp as? HTTPURLResponse)?.statusCode == 200, allowed(resp?.url) else { return }
+            ok = (try? FileManager.default.moveItem(at: tmp, to: dest)) != nil
+        }
+        task.resume()
+        sem.wait()
+        return ok
+    }
+}
+
+// Panel line: shown only while an update is pending, installing, or just checked.
+struct UpdateRow: View {
+    @ObservedObject var updater: Updater
+
+    var body: some View {
+        if let m = updater.message {
+            Text(verbatim: m)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if let v = updater.available, !updater.busy {
+            HStack(spacing: 6) {
+                Text(verbatim: "Update \(v) available")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Button("Install") { Task { await updater.install() } }
+                    .buttonStyle(.link)
+                    .font(.system(size: 10, weight: .semibold))
+            }
         }
     }
 }
@@ -992,6 +1265,7 @@ enum Parser {
     static func windows(from obj: Any) -> [UsageWindow] {
         var out: [String: UsageWindow] = [:]
         walk(obj, key: nil, &out)
+        scoped(obj, &out)
         return out.values.filter { isShown($0.id) }
             .sorted { (rank($0.id), $0.id) < (rank($1.id), $1.id) }
     }
@@ -1009,6 +1283,21 @@ enum Parser {
             for (k, v) in d { walk(v, key: k, &out) }
         } else if let a = obj as? [Any] {
             for v in a { walk(v, key: key, &out) }
+        }
+    }
+
+    // Per-model weekly limits arrive as
+    //   limits: [{ kind: "weekly_scoped", percent: 64, resets_at: "…",
+    //              scope: { model: { display_name: "Fable" } } }, …]
+    // (Max and Ultra: Fable may use up to half the weekly limit). Entries with a
+    // null scope duplicate seven_day and are skipped.
+    private static func scoped(_ obj: Any, _ out: inout [String: UsageWindow]) {
+        guard let d = obj as? [String: Any], let limits = d["limits"] as? [[String: Any]] else { return }
+        for l in limits where (l["kind"] as? String) == "weekly_scoped" {
+            guard let model = ((l["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String,
+                  let pct = ((l["percent"] ?? l["utilization"]) as? NSNumber)?.doubleValue else { continue }
+            let id = "seven_day_" + model.lowercased().replacingOccurrences(of: " ", with: "_")
+            out[id] = UsageWindow(id: id, pct: pct, resetsAt: date(l["resets_at"]))
         }
     }
 
@@ -1123,7 +1412,23 @@ final class LogIndex: @unchecked Sendable {
 // MARK: - UI
 
 private let contentWidth: CGFloat = 230
-private let gaugeSize: CGFloat = 44
+
+// Collapsed ring size, from the right-click menu. Large/Extra Large are for big or
+// far-away displays; the expanded panel stays the same size.
+enum WidgetSize: String, CaseIterable, Identifiable {
+    case small, medium, large, xlarge
+    var id: String { rawValue }
+    var points: CGFloat { [44, 58, 76, 100][Self.allCases.firstIndex(of: self)!] }
+    var title: String { ["Small", "Medium", "Large", "Extra Large"][Self.allCases.firstIndex(of: self)!] }
+
+    static let key = "TokenTide.size"
+    static var current: WidgetSize {
+        get { UserDefaults.standard.string(forKey: key).flatMap(WidgetSize.init) ?? .small }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: key) }
+    }
+}
+
+var gaugeSize: CGFloat { WidgetSize.current.points }
 
 // Claude brand clay. Used for every healthy bar/ring; only a nearly-exhausted
 // limit (<= 20% left) switches to red so the warning still reads at a glance.
@@ -1139,6 +1444,7 @@ func leftColor(_ left: Double) -> Color {
 // while the gauge and panel cross-fade. Shadow is drawn here so it tracks the shape.
 struct MeterView: View {
     @ObservedObject var store: Store
+    @ObservedObject var updater = Updater.shared   // so the menu's update toggle stays current
 
     var body: some View {
         let w = store.open ? store.panelSize.width : gaugeSize
@@ -1150,7 +1456,8 @@ struct MeterView: View {
                 ExpandedPanel(store: store)
                     .transition(.opacity)
             } else {
-                Gauge(windows: store.windows,
+                Gauge(windows: store.windows.filter { !$0.isScoped }.isEmpty
+                        ? store.windows : store.windows.filter { !$0.isScoped },
                       failed: store.windows.isEmpty && store.status != nil)
                     .transition(.opacity)
             }
@@ -1174,7 +1481,17 @@ struct MeterView: View {
             Button(store.bridgeEnabled ? "✓ Use Claude Code Status Line" : "Use Claude Code Status Line") {
                 store.toggleBridge()
             }
+            Menu("Size") {
+                ForEach(WidgetSize.allCases) { sz in
+                    Button((store.size == sz ? "✓ " : "") + sz.title) { store.size = sz }
+                }
+            }
             Button(SMAppService.mainApp.status == .enabled ? "✓ Launch at Login" : "Launch at Login") { toggleLogin() }
+            Divider()
+            Button("Check for Updates…") { Task { await Updater.shared.check(manual: true) } }
+            Button(updater.autoInstall ? "✓ Install Updates Automatically" : "Install Updates Automatically") {
+                updater.autoInstall.toggle()
+            }
             Divider()
             Button("Quit") { NSApp.terminate(nil) }
         }
@@ -1196,6 +1513,7 @@ struct MeterView: View {
 // measure the expanded window size.
 struct ExpandedPanel: View {
     @ObservedObject var store: Store
+    @ObservedObject var updater = Updater.shared
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { ctx in
@@ -1209,7 +1527,8 @@ struct ExpandedPanel: View {
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }
-                ForEach(store.windows) { WindowRow(w: $0, now: ctx.date) }
+                ForEach(store.windows.filter(\.isVisible)) { WindowRow(w: $0, now: ctx.date) }
+                UpdateRow(updater: updater)
                 if store.stats.totalDay > 0 {
                     Divider().opacity(0.4)
                     ModelShare(s: store.stats)
@@ -1243,16 +1562,20 @@ struct Gauge: View {
     private var outer: UsageWindow? { windows.first }
     private var inner: UsageWindow? { windows.dropFirst().first }
 
+    // Everything is drawn at the chosen size (not scaled as a bitmap), so text and
+    // rings stay crisp at Large / Extra Large.
+    private var k: CGFloat { gaugeSize / 44 }
+
     var body: some View {
         ZStack {
             if inner == nil {
-                ring(outer, diameter: 34, width: 6)   // single limit: one bolder ring
+                ring(outer, diameter: 34 * k, width: 6 * k)   // single limit: one bolder ring
             } else {
-                ring(outer, diameter: 36, width: 4)
-                ring(inner, diameter: 24, width: 4)
+                ring(outer, diameter: 36 * k, width: 4 * k)
+                ring(inner, diameter: 24 * k, width: 4 * k)
             }
             Text(verbatim: center)
-                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .font(.system(size: 9 * k, weight: .bold, design: .rounded))
                 .monospacedDigit()
                 .foregroundStyle(failed ? Color.secondary : Color.primary)
         }
@@ -1306,21 +1629,24 @@ struct WindowRow: View {
 
     var body: some View {
         let left = min(100, max(0, 100 - w.pct))
+        // Per-model limits render quieter: smaller, secondary text, thinner bar.
+        let sub = w.isScoped
         HStack(spacing: 6) {
             Text(verbatim: w.label)
                 .frame(width: 60, alignment: .leading)
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.primary.opacity(0.15))
-                Capsule().fill(leftColor(left)).frame(width: 48 * left / 100)
+                Capsule().fill(Color.primary.opacity(sub ? 0.1 : 0.15))
+                Capsule().fill(leftColor(left).opacity(sub ? 0.7 : 1)).frame(width: 48 * left / 100)
             }
-            .frame(width: 48, height: 6)
+            .frame(width: 48, height: sub ? 4 : 6)
             Text(verbatim: "\(Int(left.rounded()))% left")
                 .frame(width: 60, alignment: .trailing)
             Text(verbatim: countdown())
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .trailing)
         }
-        .font(.system(size: 11, weight: .medium, design: .monospaced))
+        .font(.system(size: sub ? 10 : 11, weight: sub ? .regular : .medium, design: .monospaced))
+        .foregroundStyle(sub ? AnyShapeStyle(HierarchicalShapeStyle.secondary) : AnyShapeStyle(HierarchicalShapeStyle.primary))
         .lineLimit(1)
     }
 

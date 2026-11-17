@@ -35,7 +35,7 @@ To start it automatically, right-click the widget and choose **Launch at Login**
 
 TokenTide reads the OAuth token Claude Code keeps in your Keychain, so it's built to be easy to trust:
 
-- **Only talks to `api.anthropic.com`.** HTTPS only, ephemeral session, redirects refused. There's no analytics, telemetry or update checker.
+- **Only talks to `api.anthropic.com`** for your usage: HTTPS only, ephemeral session, redirects refused. There's no analytics or telemetry. The only other host is GitHub, which the updater checks for new releases (see below).
 - **The token stays in memory.** It's never logged, shown or written to disk, and TokenTide never refreshes or modifies it.
 - **Reads the token the same way Claude Code does,** so there are no extra prompts, and it adds no new access path.
 - **Stores almost nothing:** the widget position and the last limit percentages and reset times. It never stores the raw API response.
@@ -47,11 +47,29 @@ Details and threat model: [SECURITY.md](SECURITY.md).
 ## What it shows
 
 - **Plan**: Pro / Max 5x / Max 20x / Team / Enterprise
-- **Limits**: 5-hour and 7-day windows, plus per-model weekly windows when your plan has them. Each shows % left and a reset countdown, and turns red at 20% or less.
+- **Limits**: 5-hour and 7-day windows, each with % left and a reset countdown, turning red at 20% or less. Per-model weekly limits such as **7d Fable** (Max and Ultra can spend up to half the week on Fable) appear quietly in the panel only once more than 50% used. They never take over the ring.
 - **Model mix**: share of Claude Code tokens by Opus / Sonnet / Fable / Haiku, for the current 5-hour window and for today
 - **Tokens**: Claude Code tokens in the current 5-hour window and today
 
 The widget floats above every window, on every Space and over full-screen apps. It has no Dock icon and no menu bar item. Drag it anywhere and it remembers the spot. It always expands toward the middle of the screen. Right-click it for **Refresh**, **Launch at Login** and **Quit**.
+
+**Size:** right-click → **Size** → Small, Medium, Large or Extra Large, for big or far-away displays.
+
+## Updates
+
+Release builds update themselves. Every 6 hours TokenTide asks GitHub for the latest release. If there's a newer one, it downloads it and installs it only if the new app:
+
+- passes `codesign --verify --deep --strict`,
+- is signed by the same Developer ID team as the running app, and
+- passes Gatekeeper, i.e. is notarized by Apple.
+
+It then swaps itself in place and relaunches. Your position, size and settings are kept.
+
+- **Turn it off:** right-click → **Install Updates Automatically**. With it off, the panel shows an **Install** link when an update is available.
+- **Check now:** right-click → **Check for Updates…**
+- Keep the app in `/Applications`. macOS runs apps opened straight from Downloads from a read-only location, which can't be updated.
+- Builds you make yourself with `./build.sh` (version `0.0.0-dev`) never update themselves.
+- Auto-update starts with v0.1.3. If you're on an older version, download v0.1.3 once by hand.
 
 ## How it works
 
