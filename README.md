@@ -18,7 +18,7 @@ On plans without a 5-hour limit (such as Ultra), it shows a single ring for the 
 
 ## Install
 
-**Download (recommended):** grab the latest [`TokenTide-vX.Y.Z.zip`](https://github.com/ychu824/TokenTide/releases/latest) (currently **v0.1.3**) from Releases, unzip it, and move `TokenTide.app` to `/Applications`. It's signed with a Developer ID and notarized by Apple, so it opens with a double-click.
+**Download (recommended):** grab the latest [`TokenTide-vX.Y.Z.zip`](https://github.com/ychu824/TokenTide/releases/latest) (currently **v0.1.4**) from Releases, unzip it, and move `TokenTide.app` to `/Applications`. It's signed with a Developer ID and notarized by Apple, so it opens with a double-click.
 
 **Or build from source:** needs Xcode Command Line Tools (`xcode-select --install`).
 
@@ -69,7 +69,7 @@ It then swaps itself in place and relaunches. Your position, size and settings a
 - **Check now:** right-click → **Check for Updates…**
 - Keep the app in `/Applications`. macOS runs apps opened straight from Downloads from a read-only location, which can't be updated.
 - Builds you make yourself with `./build.sh` (version `0.0.0-dev`) never update themselves.
-- Auto-update starts with v0.1.3. If you're on an older version, download v0.1.3 once by hand.
+- Auto-update starts with v0.1.4. If you're on an older version, download v0.1.4 once by hand.
 
 ## How it works
 
