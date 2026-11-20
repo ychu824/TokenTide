@@ -546,9 +546,21 @@ final class Store: ObservableObject {
 
     // Status-line windows (5h/7d, fresher) override the API's; per-model windows
     // only come from the API.
+    //
+    // Within one window (same reset time) usage only goes up, so never let a lower
+    // reading replace a higher one. Two sources lag each other: the status line runs
+    // when you send a message (prefill) with the rate_limits from that session's
+    // *previous* response, other Claude Code sessions carry older numbers too, and
+    // the usage endpoint trails the response headers. Without this the ring jumped
+    // back up during a request and then fell again.
     private func merge(_ fresh: [UsageWindow], at: Date) {
         var byId = Dictionary(uniqueKeysWithValues: apiWindows.map { ($0.id, $0) })
         for w in fresh { byId[w.id] = w }
+        for (id, w) in byId {
+            if let cur = windows.first(where: { $0.id == id }), Self.sameWindow(cur, w), cur.pct > w.pct {
+                byId[id] = cur
+            }
+        }
         let merged = byId.values.filter { Parser.isShown($0.id) }
             .sorted { (Parser.rank($0.id), $0.id) < (Parser.rank($1.id), $1.id) }
         guard !merged.isEmpty else { return }
@@ -559,6 +571,14 @@ final class Store: ObservableObject {
             UserDefaults.standard.set(updatedAt, forKey: Self.cacheTimeKey)
         }
         if Date().timeIntervalSince(at) < 600, status?.hasPrefix("Rate limited") == true || status?.hasPrefix("Can't reach") == true { status = nil }
+    }
+
+    // Same window = both have a reset time and they agree to within 2 min (the API
+    // and the status line round differently). A new reset time means a new window,
+    // where a lower number is real.
+    private static func sameWindow(_ a: UsageWindow, _ b: UsageWindow) -> Bool {
+        guard let ra = a.resetsAt, let rb = b.resetsAt else { return false }
+        return abs(ra.timeIntervalSince(rb)) < 120
     }
 
     func toggleBridge() {
