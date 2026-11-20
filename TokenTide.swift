@@ -1508,6 +1508,7 @@ struct MeterView: View {
             }
             Button(SMAppService.mainApp.status == .enabled ? "✓ Launch at Login" : "Launch at Login") { toggleLogin() }
             Divider()
+            Text(verbatim: "TokenTide \(Updater.current)")     // disabled label: current version
             Button("Check for Updates…") { Task { await Updater.shared.check(manual: true) } }
             Button(updater.autoInstall ? "✓ Install Updates Automatically" : "Install Updates Automatically") {
                 updater.autoInstall.toggle()
