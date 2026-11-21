@@ -1345,8 +1345,7 @@ final class LogIndex: @unchecked Sendable {
     }
 
     private var offsets: [String: UInt64] = [:]
-    private var entries: [Entry] = []
-    private var seen = Set<String>()
+    private var entries: [String: Entry] = [:]     // one per API response (message id)
     private var lastCutoff = Date.distantPast
     private static let usageMarker = Data("\"usage\"".utf8)
 
@@ -1388,8 +1387,7 @@ final class LogIndex: @unchecked Sendable {
             }
         }
         if cutoff > lastCutoff {
-            entries.removeAll { $0.t < cutoff }
-            seen = Set(entries.map(\.key))
+            entries = entries.filter { $0.value.t >= cutoff }
             lastCutoff = cutoff
         }
     }
@@ -1403,18 +1401,22 @@ final class LogIndex: @unchecked Sendable {
               let u = msg["usage"] as? [String: Any],
               let ts = o["timestamp"] as? String,
               let t = Parser.iso(ts), t >= cutoff else { return }
-        // Streaming writes the same message several times; dedupe.
-        let key = "\(msg["id"] as? String ?? "")|\(o["requestId"] as? String ?? UUID().uuidString)"
-        guard seen.insert(key).inserted else { return }
+        // One API response is written as several lines (one per content block), and
+        // resumed/forked sessions copy earlier messages into new files. The message id
+        // identifies the response everywhere, so count it once. Earlier lines can carry
+        // a partial output_tokens, so keep the largest reading. Lines with no id can't
+        // be deduplicated safely and are skipped rather than double-counted.
+        guard let key = (msg["id"] as? String) ?? (o["requestId"] as? String), !key.isEmpty else { return }
         let n = ["input_tokens", "output_tokens", "cache_creation_input_tokens"]
             .reduce(0) { $0 + ((u[$1] as? NSNumber)?.intValue ?? 0) }
         guard n > 0 else { return }
-        entries.append(Entry(t: t, fam: Family.of(msg["model"] as? String), n: n, key: key))
+        if let e = entries[key], e.n >= n { return }
+        entries[key] = Entry(t: entries[key]?.t ?? t, fam: Family.of(msg["model"] as? String), n: n, key: key)
     }
 
     func sum(since5h: Date, sinceDay: Date) -> TokenStats {
         var s = TokenStats()
-        for e in entries {
+        for e in entries.values {
             if s.lastActivity.map({ e.t > $0 }) ?? true { s.lastActivity = e.t }
             if e.t >= since5h {
                 s.total5h += e.n
