@@ -348,6 +348,15 @@ struct TokenStats: Equatable {
     var by5h: [String: Int] = [:]
     var byDay: [String: Int] = [:]
     var lastActivity: Date?      // newest Claude Code API call seen in the logs
+    // Prompt caching: tokens read from cache vs all input tokens
+    // (uncached input + cache writes + cache reads).
+    var cacheRead5h = 0, input5h = 0
+    var cacheReadDay = 0, inputDay = 0
+
+    // Share of input served from the prompt cache; nil when there's no input yet.
+    static func hitRate(_ read: Int, _ input: Int) -> Int? {
+        input > 0 ? Int((Double(read) / Double(input) * 100).rounded()) : nil
+    }
 }
 
 enum Family {
@@ -1340,7 +1349,9 @@ final class LogIndex: @unchecked Sendable {
     private struct Entry {
         let t: Date
         let fam: String
-        let n: Int
+        let n: Int           // input + output + cache writes (what "tok" shows)
+        let cacheRead: Int
+        let input: Int       // input + cache writes + cache reads
         let key: String
     }
 
@@ -1407,11 +1418,15 @@ final class LogIndex: @unchecked Sendable {
         // a partial output_tokens, so keep the largest reading. Lines with no id can't
         // be deduplicated safely and are skipped rather than double-counted.
         guard let key = (msg["id"] as? String) ?? (o["requestId"] as? String), !key.isEmpty else { return }
-        let n = ["input_tokens", "output_tokens", "cache_creation_input_tokens"]
-            .reduce(0) { $0 + ((u[$1] as? NSNumber)?.intValue ?? 0) }
-        guard n > 0 else { return }
+        func int(_ k: String) -> Int { (u[k] as? NSNumber)?.intValue ?? 0 }
+        let n = int("input_tokens") + int("output_tokens") + int("cache_creation_input_tokens")
+        let read = int("cache_read_input_tokens")
+        guard n > 0 || read > 0 else { return }
         if let e = entries[key], e.n >= n { return }
-        entries[key] = Entry(t: entries[key]?.t ?? t, fam: Family.of(msg["model"] as? String), n: n, key: key)
+        entries[key] = Entry(t: entries[key]?.t ?? t, fam: Family.of(msg["model"] as? String), n: n,
+                             cacheRead: read,
+                             input: int("input_tokens") + int("cache_creation_input_tokens") + read,
+                             key: key)
     }
 
     func sum(since5h: Date, sinceDay: Date) -> TokenStats {
@@ -1421,10 +1436,14 @@ final class LogIndex: @unchecked Sendable {
             if e.t >= since5h {
                 s.total5h += e.n
                 s.by5h[e.fam, default: 0] += e.n
+                s.cacheRead5h += e.cacheRead
+                s.input5h += e.input
             }
             if e.t >= sinceDay {
                 s.totalDay += e.n
                 s.byDay[e.fam, default: 0] += e.n
+                s.cacheReadDay += e.cacheRead
+                s.inputDay += e.input
             }
         }
         return s
@@ -1562,6 +1581,12 @@ struct ExpandedPanel: View {
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if let line = cacheLine(store.stats) {
+                    Text(verbatim: line)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .help("Prompt cache hit rate = cache reads ÷ all input tokens (uncached + cache writes + cache reads), from Claude Code's logs. Cache reads are cheap and aren't included in \"tok\".")
+                }
                 Text(verbatim: "tok  5h \(fmt(store.stats.total5h)) · today \(fmt(store.stats.totalDay))" + ageText(store.updatedAt, now: ctx.date))
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.tertiary)
@@ -1625,6 +1650,13 @@ struct Gauge: View {
         }
         .frame(width: diameter, height: diameter)
     }
+}
+
+// "cache 5h 94% · today 92% · read 20M"; nil before any Claude Code input today.
+func cacheLine(_ s: TokenStats) -> String? {
+    guard let day = TokenStats.hitRate(s.cacheReadDay, s.inputDay) else { return nil }
+    let h5 = TokenStats.hitRate(s.cacheRead5h, s.input5h).map { "\($0)%" } ?? "–"
+    return "cache 5h \(h5) · today \(day)% · read \(fmt(s.cacheReadDay))"
 }
 
 // " · 12m ago" for the panel footer; nothing when the data is fresh.
