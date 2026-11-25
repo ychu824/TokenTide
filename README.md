@@ -4,6 +4,10 @@
 
 A tiny always-on-top macOS widget that shows how much of your Claude plan is left.
 
+[![Downloads](https://img.shields.io/github/downloads/ychu824/TokenTide/total?color=D97757&label=downloads)](https://github.com/ychu824/TokenTide/releases)
+[![Latest release](https://img.shields.io/github/v/release/ychu824/TokenTide?color=D97757)](https://github.com/ychu824/TokenTide/releases/latest)
+[![Stars](https://img.shields.io/github/stars/ychu824/TokenTide?color=D97757)](https://github.com/ychu824/TokenTide/stargazers)
+
 <p align="center"><img src="docs/demo.gif" width="420" alt="TokenTide: a ring gauge that expands into a usage panel on hover"></p>
 
 **At rest** it's a small clay-tinted circle with two rings:
