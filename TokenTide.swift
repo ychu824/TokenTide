@@ -469,6 +469,8 @@ final class Store: ObservableObject {
         static let pollActive: TimeInterval = 600       // Claude Code used in the last 15 min
         static let pollIdle: TimeInterval = 1800
         static let pollWithBridge: TimeInterval = 3600  // status line already gives live 5h/7d
+        static let pollScoped: TimeInterval = 600       // a per-model weekly limit is near/over the show threshold
+        static let scopedWatch: Double = 40             // ...meaning at or above this percent
         static let hoverStale: TimeInterval = 900       // opening the panel refetches only if older
         static let minGap: TimeInterval = 120           // between any two automatic attempts
         static let manualGap: TimeInterval = 60         // between two manual Refreshes
@@ -530,19 +532,31 @@ final class Store: ObservableObject {
 
     // How long a fetched result is good for.
     //  - Status-line bridge is feeding fresh 5h/7d numbers: the API is only needed for
-    //    the plan and per-model weekly windows, so 30 min.
-    //  - Claude Code active in the last 15 min: numbers are moving, 5 min.
-    //  - Otherwise (idle, or only using claude.ai): 15 min.
+    //    the plan and per-model weekly windows, so 60 min.
+    //  - Claude Code active in the last 15 min: numbers are moving, 10 min.
+    //  - Otherwise (idle, or only using claude.ai): 30 min.
+    //  - A per-model weekly limit (Fable) is at 40%+: it only comes from the API, and
+    //    the status line can't see it (nor usage from the desktop app), so at most 10 min.
     private var pollInterval: TimeInterval {
         let now = Date()
-        if now.timeIntervalSince(bridgeAt) < 600 { return Policy.pollWithBridge }
-        if let a = stats.lastActivity, now.timeIntervalSince(a) < 900 { return Policy.pollActive }
-        return Policy.pollIdle
+        let base: TimeInterval
+        if now.timeIntervalSince(bridgeAt) < 600 { base = Policy.pollWithBridge }
+        else if let a = stats.lastActivity, now.timeIntervalSince(a) < 900 { base = Policy.pollActive }
+        else { base = Policy.pollIdle }
+        return scopedHot ? min(base, Policy.pollScoped) : base
+    }
+
+    // True while a per-model weekly limit is close to (or past) the point where it shows.
+    private var scopedHot: Bool {
+        apiWindows.contains { $0.isScoped && $0.pct >= Policy.scopedWatch }
     }
 
     // Called when the panel opens: fetch only if what's on screen is getting old.
+    // A fresh status line covers 5h/7d but not the per-model limits, so while one of
+    // those is hot only the API's own age counts.
     func refreshIfStale() {
-        if Date().timeIntervalSince(max(apiFetchedAt, bridgeAt)) > Policy.hoverStale { refresh() }
+        let seen = scopedHot ? apiFetchedAt : max(apiFetchedAt, bridgeAt)
+        if Date().timeIntervalSince(seen) > Policy.hoverStale { refresh() }
     }
 
     // MARK: Status-line bridge
